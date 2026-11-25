@@ -450,3 +450,287 @@ export async function exportDocumentToWord(scannedDoc: ScannedDocument): Promise
   const outName = `${stripExtension(scannedDoc.fileName)}-editado.docx`;
   triggerDownload(blob, outName);
 }
+
+// ============================================================================
+// Generador nativo de OpenDocument Text (.odt) editable y 100% fiel al PDF
+// ============================================================================
+
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i += 1) {
+    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Empaquetador ZIP estándar (método STORE = 0), ideal para .odt donde mimetype debe ir primero y sin comprimir
+ */
+function buildZipStore(entries: { name: string; data: Uint8Array }[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const data = entry.data;
+    const checksum = crc32(data);
+
+    // Local File Header (30 bytes + name)
+    const localHeader = new Uint8Array(30 + nameBytes.length);
+    const lv = new DataView(localHeader.buffer);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, 20, true); // version needed
+    lv.setUint16(6, 0x0800, true); // UTF-8 filename flag
+    lv.setUint16(8, 0, true); // method: STORE
+    lv.setUint16(10, 0, true);
+    lv.setUint16(12, 0, true);
+    lv.setUint32(14, checksum, true);
+    lv.setUint32(18, data.length, true);
+    lv.setUint32(22, data.length, true);
+    lv.setUint16(26, nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+    localHeader.set(nameBytes, 30);
+
+    localParts.push(localHeader, data);
+
+    // Central Directory Header (46 bytes + name)
+    const centralHeader = new Uint8Array(46 + nameBytes.length);
+    const cv = new DataView(centralHeader.buffer);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, 20, true); // version made by
+    cv.setUint16(6, 20, true); // version needed
+    cv.setUint16(8, 0x0800, true); // UTF-8
+    cv.setUint16(10, 0, true); // method: STORE
+    cv.setUint16(12, 0, true);
+    cv.setUint16(14, 0, true);
+    cv.setUint32(16, checksum, true);
+    cv.setUint32(20, data.length, true);
+    cv.setUint32(24, data.length, true);
+    cv.setUint16(28, nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint16(36, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, offset, true);
+    centralHeader.set(nameBytes, 46);
+
+    centralParts.push(centralHeader);
+    offset += localHeader.length + data.length;
+  }
+
+  const centralSize = centralParts.reduce((s, p) => s + p.length, 0);
+
+  // End of Central Directory Record (22 bytes)
+  const eocd = new Uint8Array(22);
+  const ev = new DataView(eocd.buffer);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+  ev.setUint16(20, 0, true);
+
+  const totalLen = offset + centralSize + eocd.length;
+  const out = new Uint8Array(totalLen);
+  let pos = 0;
+  for (const part of localParts) {
+    out.set(part, pos);
+    pos += part.length;
+  }
+  for (const part of centralParts) {
+    out.set(part, pos);
+    pos += part.length;
+  }
+  out.set(eocd, pos);
+  return out;
+}
+
+/**
+ * Exporta el documento editado a OpenDocument Text (.odt) editable y fiel al PDF:
+ * - Cada página conserva su tamaño y orientación exacta (horizontal o vertical).
+ * - Fondo exacto del PDF (logos, bordes de tabla, líneas, colores y texto vertical actualizado).
+ * - Cuadros de texto nativos (<draw:text-box>) en coordenadas exactas editables en LibreOffice / Word.
+ */
+export async function exportDocumentToOdt(scannedDoc: ScannedDocument): Promise<void> {
+  if (scannedDoc.pages.length === 0) return;
+
+  const encoder = new TextEncoder();
+  const entries: { name: string; data: Uint8Array }[] = [];
+  const manifestPictures: string[] = [];
+
+  // 1. mimetype (siempre primero y sin comprimir según estándar OASIS ODF)
+  entries.push({
+    name: 'mimetype',
+    data: encoder.encode('application/vnd.oasis.opendocument.text'),
+  });
+
+  // 2. Generar fondos de página PNG y recopilar estilos/elementos XML
+  const pageLayoutsXml: string[] = [];
+  const masterPagesXml: string[] = [];
+  const contentAutoStylesXml: string[] = [];
+  const bodyParagraphsXml: string[] = [];
+
+  contentAutoStylesXml.push(
+    `<style:style style:name="fr_bg" style:family="graphic">
+      <style:graphic-properties style:run-through="background" style:wrap="run-through" style:horizontal-pos="from-left" style:horizontal-rel="page" style:vertical-pos="from-top" style:vertical-rel="page" draw:stroke="none" draw:fill="none" fo:border="none" fo:padding="0pt"/>
+    </style:style>`,
+    `<style:style style:name="fr_txt" style:family="graphic">
+      <style:graphic-properties style:run-through="foreground" style:wrap="none" style:horizontal-pos="from-left" style:horizontal-rel="page" style:vertical-pos="from-top" style:vertical-rel="page" draw:stroke="none" draw:fill="none" fo:border="none" fo:padding="0pt"/>
+    </style:style>`
+  );
+
+  let fieldStyleCounter = 0;
+
+  for (let pIdx = 0; pIdx < scannedDoc.pages.length; pIdx += 1) {
+    const page = scannedDoc.pages[pIdx];
+    const pageNum = pIdx + 1;
+    const isLandscape = page.width > page.height;
+    const picPath = `Pictures/page-${pageNum}.png`;
+
+    const bgPng = await buildWordPageBackgroundPng(page);
+    entries.push({ name: picPath, data: bgPng });
+    manifestPictures.push(
+      `  <manifest:file-entry manifest:full-path="${picPath}" manifest:media-type="image/png"/>`
+    );
+
+    pageLayoutsXml.push(
+      `<style:page-layout style:name="pm${pageNum}">
+        <style:page-layout-properties fo:page-width="${page.width.toFixed(2)}pt" fo:page-height="${page.height.toFixed(2)}pt" style:print-orientation="${isLandscape ? 'landscape' : 'portrait'}" fo:margin-top="0pt" fo:margin-bottom="0pt" fo:margin-left="0pt" fo:margin-right="0pt"/>
+      </style:page-layout>`
+    );
+
+    masterPagesXml.push(
+      `<style:master-page style:name="mp${pageNum}" style:page-layout-name="pm${pageNum}"/>`
+    );
+
+    contentAutoStylesXml.push(
+      `<style:style style:name="P_PAGE_${pageNum}" style:family="paragraph" style:master-page-name="mp${pageNum}">
+        <style:paragraph-properties fo:margin-top="0pt" fo:margin-bottom="0pt" fo:break-before="${pageNum > 1 ? 'page' : 'auto'}"/>
+      </style:style>`
+    );
+
+    const framesXml: string[] = [];
+
+    // Imagen de fondo cubriendo el 100% de la página
+    framesXml.push(
+      `<draw:frame draw:style-name="fr_bg" draw:name="FondoPag${pageNum}" text:anchor-type="page" text:anchor-page-number="${pageNum}" draw:z-index="0" svg:x="0pt" svg:y="0pt" svg:width="${page.width.toFixed(2)}pt" svg:height="${page.height.toFixed(2)}pt">
+        <draw:image xlink:href="${picPath}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>
+      </draw:frame>`
+    );
+
+    // Campos de texto editables posicionados en coordenadas exactas
+    for (const field of page.fields) {
+      if (field.rotation !== 0) continue;
+      if (field.isDeleted || !field.text.trim()) continue;
+
+      fieldStyleCounter += 1;
+      const stName = `P_F_${fieldStyleCounter}`;
+      const odtAlign =
+        field.align === 'center' ? 'center' : field.align === 'right' ? 'end' : 'start';
+      const colorHex = normalizeHex6(field.textColor, '0F172A');
+
+      contentAutoStylesXml.push(
+        `<style:style style:name="${stName}" style:family="paragraph">
+          <style:paragraph-properties fo:text-align="${odtAlign}" fo:margin-top="0pt" fo:margin-bottom="0pt" fo:line-height="115%"/>
+          <style:text-properties fo:font-family="Arial" fo:font-size="${Math.max(6, field.fontSize).toFixed(1)}pt" fo:font-weight="${field.isBold ? 'bold' : 'normal'}" fo:color="#${colorHex}"/>
+        </style:style>`
+      );
+
+      const xPt = Math.max(0, field.x).toFixed(2);
+      const yPt = Math.max(0, field.y).toFixed(2);
+      const wPt = Math.max(14, field.width + 8).toFixed(2);
+      const hPt = Math.max(10, field.height + 2).toFixed(2);
+
+      framesXml.push(
+        `<draw:frame draw:style-name="fr_txt" draw:name="Campo_${fieldStyleCounter}" text:anchor-type="page" text:anchor-page-number="${pageNum}" draw:z-index="1" svg:x="${xPt}pt" svg:y="${yPt}pt" svg:width="${wPt}pt" svg:height="${hPt}pt">
+          <draw:text-box>
+            <text:p text:style-name="${stName}">${escapeXml(field.text)}</text:p>
+          </draw:text-box>
+        </draw:frame>`
+      );
+    }
+
+    bodyParagraphsXml.push(
+      `<text:p text:style-name="P_PAGE_${pageNum}">${framesXml.join('')}</text:p>`
+    );
+  }
+
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-styles xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.2">
+  <office:automatic-styles>
+    ${pageLayoutsXml.join('\n    ')}
+  </office:automatic-styles>
+  <office:master-styles>
+    ${masterPagesXml.join('\n    ')}
+  </office:master-styles>
+</office:document-styles>`;
+
+  const contentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" office:version="1.2">
+  <office:automatic-styles>
+    ${contentAutoStylesXml.join('\n    ')}
+  </office:automatic-styles>
+  <office:body>
+    <office:text>
+      ${bodyParagraphsXml.join('\n      ')}
+    </office:text>
+  </office:body>
+</office:document-content>`;
+
+  const metaXml = `<?xml version="1.0" encoding="UTF-8"?>
+<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.2">
+  <office:meta>
+    <dc:title>${escapeXml(stripExtension(scannedDoc.fileName))}</dc:title>
+  </office:meta>
+</office:document-meta>`;
+
+  const manifestXml = `<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+  <manifest:file-entry manifest:full-path="/" manifest:version="1.2" manifest:media-type="application/vnd.oasis.opendocument.text"/>
+  <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+  <manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/>
+  <manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>
+${manifestPictures.join('\n')}
+</manifest:manifest>`;
+
+  entries.push(
+    { name: 'styles.xml', data: encoder.encode(stylesXml) },
+    { name: 'content.xml', data: encoder.encode(contentXml) },
+    { name: 'meta.xml', data: encoder.encode(metaXml) },
+    { name: 'META-INF/manifest.xml', data: encoder.encode(manifestXml) }
+  );
+
+  const zipBytes = buildZipStore(entries);
+  const copy = new Uint8Array(zipBytes);
+  const blob = new Blob([copy.buffer], {
+    type: 'application/vnd.oasis.opendocument.text',
+  });
+  const outName = `${stripExtension(scannedDoc.fileName)}-editado.odt`;
+  triggerDownload(blob, outName);
+}

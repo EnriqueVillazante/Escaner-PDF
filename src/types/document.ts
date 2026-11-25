@@ -39,11 +39,13 @@ export interface DetectedTable {
   rowCount: number;
   colCount: number;
   columnWidths: number[];
-  /** Matriz de IDs de EditableField (puede haber null en celdas vacías) */
-  cellFieldIds: (string | null)[][];
+  /** Matriz [fila][columna] con TODOS los IDs de EditableField que caen dentro de esa celda (soporta multilínea y vacías) */
+  cellFieldIds: string[][][];
   y: number;
   hasHeader: boolean;
   headerBg: string;
+  /** Método con el que se detectó la tabla: rejilla de bordes reales o alineación de columnas */
+  detectionMethod?: 'grid' | 'alignment';
 }
 
 export interface ScannedPage {

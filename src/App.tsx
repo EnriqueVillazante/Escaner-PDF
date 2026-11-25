@@ -8,7 +8,6 @@ import {
   Eye,
   EyeOff,
   FileSpreadsheet,
-  FileText,
   FileUp,
   Minus,
   MousePointerClick,
@@ -16,7 +15,6 @@ import {
   Redo2,
   RotateCcw,
   RotateCw,
-  Table2,
   Trash2,
   Undo2,
   X,
@@ -32,22 +30,23 @@ import type {
   ScanProgress,
   TextAlign,
 } from './types/document';
-import { exportDocumentToPdf, exportDocumentToWord } from './utils/exporters';
+import {
+  exportDocumentToOdt,
+  exportDocumentToPdf,
+  exportDocumentToWord,
+} from './utils/exporters';
 import { scanPdfFile } from './utils/pdfParser';
-
-type ViewMode = 'overlay' | 'tables';
 
 export function App() {
   const [doc, setDoc] = useState<ScannedDocument | null>(null);
   const [historyPast, setHistoryPast] = useState<ScannedDocument[]>([]);
   const [historyFuture, setHistoryFuture] = useState<ScannedDocument[]>([]);
-  const [viewMode, setViewMode] = useState<ViewMode>('overlay');
   const [zoom, setZoom] = useState<number>(100);
   const [showOutlines, setShowOutlines] = useState<boolean>(true);
   const [activePageNumber, setActivePageNumber] = useState<number>(1);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
-  const [exportingType, setExportingType] = useState<'pdf' | 'word' | null>(null);
+  const [exportingType, setExportingType] = useState<'pdf' | 'word' | 'odt' | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
@@ -63,11 +62,6 @@ export function App() {
     }
     return null;
   }, [doc, selectedFieldId]);
-
-  const totalTables = useMemo(() => {
-    if (!doc) return 0;
-    return doc.pages.reduce((sum, p) => sum + p.tables.length, 0);
-  }, [doc]);
 
   const commitDocumentChange = (nextDoc: ScannedDocument) => {
     if (doc) {
@@ -110,7 +104,6 @@ export function App() {
       setHistoryPast([]);
       setHistoryFuture([]);
       setActivePageNumber(1);
-      setViewMode('overlay');
     } catch (error) {
       console.error('Error al escanear PDF:', error);
       alert(
@@ -159,26 +152,6 @@ export function App() {
     }
   };
 
-  const handleTableCellEdit = (pageNumber: number, fieldId: string, newText: string) => {
-    if (!doc) return;
-    const page = doc.pages.find((p) => p.pageNumber === pageNumber);
-    if (!page) return;
-    const updatedPage: ScannedPage = {
-      ...page,
-      fields: page.fields.map((f) =>
-        f.id === fieldId
-          ? {
-              ...f,
-              text: newText,
-              isDeleted: false,
-              isModified: f.isNew ? true : newText !== f.originalText,
-            }
-          : f
-      ),
-    };
-    handleUpdatePage(updatedPage);
-  };
-
   const handleDownloadPdf = async () => {
     if (!doc) return;
     setExportingType('pdf');
@@ -200,6 +173,19 @@ export function App() {
     } catch (err) {
       console.error('Error al exportar a Word:', err);
       alert('No se pudo generar el documento Word (.docx).');
+    } finally {
+      setExportingType(null);
+    }
+  };
+
+  const handleDownloadOdt = async () => {
+    if (!doc) return;
+    setExportingType('odt');
+    try {
+      await exportDocumentToOdt(doc);
+    } catch (err) {
+      console.error('Error al exportar a ODT:', err);
+      alert('No se pudo generar el documento ODT (.odt).');
     } finally {
       setExportingType(null);
     }
@@ -263,56 +249,33 @@ export function App() {
         {doc && (
           <>
             <div className="topbar-center">
-              <div className="segmented" role="tablist" aria-label="Modo de edición">
+              <button
+                type="button"
+                className={`btn ${showOutlines ? 'btn-active-soft' : ''}`}
+                title="Mostrar u ocultar recuadros de campos detectados"
+                onClick={() => setShowOutlines((v) => !v)}
+              >
+                {showOutlines ? <Eye size={14} /> : <EyeOff size={14} />}
+                Campos
+              </button>
+
+              <div className="zoom-group">
                 <button
                   type="button"
-                  className={`segmented-btn ${viewMode === 'overlay' ? 'active' : ''}`}
-                  onClick={() => setViewMode('overlay')}
+                  title="Alejar"
+                  onClick={() => setZoom((z) => Math.max(55, z - 10))}
                 >
-                  <FileText size={14} />
-                  PDF Exacto
+                  <ZoomOut size={14} />
                 </button>
+                <span className="zoom-label">{zoom}%</span>
                 <button
                   type="button"
-                  className={`segmented-btn ${viewMode === 'tables' ? 'active' : ''}`}
-                  onClick={() => setViewMode('tables')}
+                  title="Acercar"
+                  onClick={() => setZoom((z) => Math.min(160, z + 10))}
                 >
-                  <Table2 size={14} />
-                  Tablas ({totalTables})
+                  <ZoomIn size={14} />
                 </button>
               </div>
-
-              {viewMode === 'overlay' && (
-                <>
-                  <button
-                    type="button"
-                    className={`btn ${showOutlines ? 'btn-active-soft' : ''}`}
-                    title="Mostrar u ocultar recuadros de campos detectados"
-                    onClick={() => setShowOutlines((v) => !v)}
-                  >
-                    {showOutlines ? <Eye size={14} /> : <EyeOff size={14} />}
-                    Campos
-                  </button>
-
-                  <div className="zoom-group">
-                    <button
-                      type="button"
-                      title="Alejar"
-                      onClick={() => setZoom((z) => Math.max(55, z - 10))}
-                    >
-                      <ZoomOut size={14} />
-                    </button>
-                    <span className="zoom-label">{zoom}%</span>
-                    <button
-                      type="button"
-                      title="Acercar"
-                      onClick={() => setZoom((z) => Math.min(160, z + 10))}
-                    >
-                      <ZoomIn size={14} />
-                    </button>
-                  </div>
-                </>
-              )}
 
               <button
                 type="button"
@@ -352,6 +315,15 @@ export function App() {
               >
                 <Download size={15} />
                 {exportingType === 'word' ? 'Generando Word...' : 'Descargar Word'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-odt"
+                disabled={exportingType !== null}
+                onClick={() => void handleDownloadOdt()}
+              >
+                <Download size={15} />
+                {exportingType === 'odt' ? 'Generando ODT...' : 'Descargar ODT'}
               </button>
             </div>
           </>
@@ -393,107 +365,27 @@ export function App() {
 
           {/* Lienzo principal */}
           <main className="canvas-scroll" onClick={() => setSelectedFieldId(null)}>
-            {viewMode === 'overlay' ? (
-              doc.pages.map((page) => (
-                <section
-                  key={page.pageNumber}
-                  ref={(el) => {
-                    pageRefs.current[page.pageNumber] = el as HTMLDivElement | null;
-                  }}
-                  className="page-pair-wrapper"
-                  onMouseEnter={() => setActivePageNumber(page.pageNumber)}
-                >
-                  <EditablePage
-                    page={page}
-                    zoom={zoom}
-                    showOutlines={showOutlines}
-                    addTextMode={false}
-                    selectedFieldId={selectedFieldId}
-                    onSelectField={setSelectedFieldId}
-                    onExitAddTextMode={() => {}}
-                    onUpdatePage={handleUpdatePage}
-                  />
-                </section>
-              ))
-            ) : (
-              <div className="tables-view-container">
-                {doc.pages.map((page) => {
-                  const fieldMap = new Map<string, EditableField>();
-                  page.fields.forEach((f) => fieldMap.set(f.id, f));
-
-                  return (
-                    <div key={page.pageNumber} className="tables-page-card">
-                      <h3 className="tables-page-title">
-                        Página {page.pageNumber} — {page.tables.length}{' '}
-                        {page.tables.length === 1 ? 'tabla detectada' : 'tablas detectadas'}
-                      </h3>
-
-                      {page.tables.length === 0 ? (
-                        <div className="empty-page-hint">
-                          No se detectaron tablas estructuradas en esta página. Edita cada
-                          campo directamente en la vista <strong>PDF Exacto</strong>.
-                        </div>
-                      ) : (
-                        page.tables.map((tbl, tIdx) => (
-                          <div key={tbl.id} className="sync-table-wrap">
-                            <div className="sync-table-label">
-                              Tabla {tIdx + 1} ({tbl.rowCount} filas × {tbl.colCount} columnas)
-                            </div>
-                            <table className="doc-table">
-                              <tbody>
-                                {tbl.cellFieldIds.map((rowIds, rIdx) => {
-                                  const isHeader = tbl.hasHeader && rIdx === 0;
-                                  return (
-                                    <tr
-                                      key={rIdx}
-                                      className={isHeader ? 'doc-table-header-row' : undefined}
-                                      style={
-                                        isHeader
-                                          ? { backgroundColor: tbl.headerBg || '#1e3a8a' }
-                                          : undefined
-                                      }
-                                    >
-                                      {rowIds.map((fid, cIdx) => {
-                                        const fld = fid ? fieldMap.get(fid) : undefined;
-                                        return (
-                                          <td key={cIdx}>
-                                            {fld ? (
-                                              <input
-                                                type="text"
-                                                value={fld.isDeleted ? '' : fld.text}
-                                                className="cell-input"
-                                                style={{
-                                                  textAlign: fld.align,
-                                                  fontWeight: isHeader || fld.isBold ? 700 : 400,
-                                                }}
-                                                onFocus={() => setSelectedFieldId(fld.id)}
-                                                onChange={(e) =>
-                                                  handleTableCellEdit(
-                                                    page.pageNumber,
-                                                    fld.id,
-                                                    e.target.value
-                                                  )
-                                                }
-                                              />
-                                            ) : (
-                                              <span className="empty-cell-dash">—</span>
-                                            )}
-                                          </td>
-                                        );
-                                      })}
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+            {doc.pages.map((page) => (
+              <section
+                key={page.pageNumber}
+                ref={(el) => {
+                  pageRefs.current[page.pageNumber] = el as HTMLDivElement | null;
+                }}
+                className="page-pair-wrapper"
+                onMouseEnter={() => setActivePageNumber(page.pageNumber)}
+              >
+                <EditablePage
+                  page={page}
+                  zoom={zoom}
+                  showOutlines={showOutlines}
+                  addTextMode={false}
+                  selectedFieldId={selectedFieldId}
+                  onSelectField={setSelectedFieldId}
+                  onExitAddTextMode={() => {}}
+                  onUpdatePage={handleUpdatePage}
+                />
+              </section>
+            ))}
           </main>
 
           {/* Panel lateral derecho: Inspector y editor cómodo del campo seleccionado (siempre en horizontal) */}

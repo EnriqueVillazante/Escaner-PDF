@@ -20,7 +20,6 @@ interface RawTextItem {
   height: number;
   fontSize: number;
   isBold: boolean;
-  /** Ángulo normalizado en grados: 0 (horizontal), -90 (vertical arriba), 90 (vertical abajo), 180, u otro */
   rotation: number;
 }
 
@@ -41,6 +40,15 @@ interface TextLine {
   fontSize: number;
   height: number;
   segments: LineSegment[];
+}
+
+interface VisualTableGrid {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  colLines: number[]; // coordenadas X en puntos PDF ordenadas
+  rowLines: number[]; // coordenadas Y en puntos PDF ordenadas
 }
 
 let idCounter = 1;
@@ -69,8 +77,7 @@ function looksNumeric(text: string): boolean {
 }
 
 function normalizeAngleDeg(deg: number): number {
-  let a = ((deg + 180) % 360 + 360) % 360 - 180;
-  // Ajustar ángulos casi exactos a 0, 90, -90, 180
+  const a = (((deg + 180) % 360) + 360) % 360 - 180;
   if (Math.abs(a) <= 4) return 0;
   if (Math.abs(a - 90) <= 4) return 90;
   if (Math.abs(a + 90) <= 4) return -90;
@@ -89,9 +96,159 @@ function relativeLuminance(r: number, g: number, b: number): number {
 }
 
 /**
- * Detecta si existe una línea vertical de borde de tabla en el canvas entre x1Pt y x2Pt.
- * Si existe una línea divisoria real, jamás se fusionan dos palabras de columnas distintas.
+ * Agrupa coordenadas numéricas cercanas (por ejemplo, líneas de borde de 2-3 px de grosor)
  */
+function clusterPositions(values: number[], tolerance: number): number[] {
+  if (values.length === 0) return [];
+  const sorted = [...values].sort((a, b) => a - b);
+  const clusters: number[][] = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const last = clusters[clusters.length - 1];
+    if (sorted[i] - last[last.length - 1] <= tolerance) {
+      last.push(sorted[i]);
+    } else {
+      clusters.push([sorted[i]]);
+    }
+  }
+  return clusters.map((c) => c.reduce((s, v) => s + v, 0) / c.length);
+}
+
+/**
+ * Detecta rejillas reales de tablas (líneas horizontales y verticales dibujadas) directamente en el canvas.
+ * Funciona tanto en PDFs digitales como en PDFs escaneados con tablas con bordes.
+ */
+function detectVisualTableGrids(
+  ctx: CanvasRenderingContext2D | null,
+  canvasWidth: number,
+  canvasHeight: number,
+  renderScale: number
+): VisualTableGrid[] {
+  if (!ctx || canvasWidth < 40 || canvasHeight < 40) return [];
+
+  const imgData = ctx.getImageData(0, 0, canvasWidth, canvasHeight).data;
+  const isDark = (x: number, y: number): boolean => {
+    const idx = (y * canvasWidth + x) * 4;
+    return relativeLuminance(imgData[idx], imgData[idx + 1], imgData[idx + 2]) < 0.82;
+  };
+
+  // 1. Detectar segmentos horizontales largos (>= 22% del ancho de página)
+  const minHorizLen = Math.max(80, Math.round(canvasWidth * 0.22));
+  const hSegments: { y: number; x1: number; x2: number }[] = [];
+
+  for (let y = 2; y < canvasHeight - 2; y += 1) {
+    let runStart = -1;
+    let gapAllowed = 0;
+    for (let x = 0; x < canvasWidth; x += 1) {
+      if (isDark(x, y)) {
+        if (runStart < 0) runStart = x;
+        gapAllowed = 0;
+      } else if (runStart >= 0) {
+        gapAllowed += 1;
+        if (gapAllowed > 2) {
+          const runEnd = x - gapAllowed;
+          if (runEnd - runStart >= minHorizLen) {
+            hSegments.push({ y, x1: runStart, x2: runEnd });
+          }
+          runStart = -1;
+          gapAllowed = 0;
+        }
+      }
+    }
+    if (runStart >= 0 && canvasWidth - 1 - runStart >= minHorizLen) {
+      hSegments.push({ y, x1: runStart, x2: canvasWidth - 1 });
+    }
+  }
+
+  if (hSegments.length < 3) return [];
+
+  // Fusionar líneas horizontales adyacentes (grosor de borde 1-4 px)
+  const mergedH: { y: number; x1: number; x2: number }[] = [];
+  for (const seg of hSegments) {
+    const prev = mergedH[mergedH.length - 1];
+    if (
+      prev &&
+      seg.y - prev.y <= 4 &&
+      Math.abs(seg.x1 - prev.x1) <= 18 &&
+      Math.abs(seg.x2 - prev.x2) <= 18
+    ) {
+      prev.y = (prev.y + seg.y) / 2;
+      prev.x1 = Math.min(prev.x1, seg.x1);
+      prev.x2 = Math.max(prev.x2, seg.x2);
+    } else {
+      mergedH.push({ ...seg });
+    }
+  }
+
+  // Agrupar líneas horizontales que pertenecen a la misma tabla (mismo rango X y separación razonable)
+  const hGroups: { y: number; x1: number; x2: number }[][] = [];
+  for (const line of mergedH) {
+    let placed = false;
+    for (const grp of hGroups) {
+      const ref = grp[grp.length - 1];
+      const overlap = Math.min(line.x2, ref.x2) - Math.max(line.x1, ref.x1);
+      const minW = Math.min(line.x2 - line.x1, ref.x2 - ref.x1);
+      const dy = line.y - ref.y;
+      if (overlap >= minW * 0.75 && dy > 6 && dy <= canvasHeight * 0.25) {
+        grp.push(line);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      hGroups.push([line]);
+    }
+  }
+
+  const grids: VisualTableGrid[] = [];
+
+  for (const grp of hGroups) {
+    if (grp.length < 3) continue; // Mínimo 2 filas (3 líneas horizontales)
+
+    const topPx = Math.round(grp[0].y);
+    const botPx = Math.round(grp[grp.length - 1].y);
+    const leftPx = Math.round(Math.min(...grp.map((g) => g.x1)));
+    const rightPx = Math.round(Math.max(...grp.map((g) => g.x2)));
+    const tableHeightPx = botPx - topPx;
+    if (tableHeightPx < 24) continue;
+
+    // 2. Buscar líneas verticales dentro del rectángulo [leftPx..rightPx, topPx..botPx]
+    const vCandidates: number[] = [];
+    for (let x = Math.max(0, leftPx - 4); x <= Math.min(canvasWidth - 1, rightPx + 4); x += 1) {
+      let darkPixels = 0;
+      for (let y = topPx; y <= botPx; y += 1) {
+        if (isDark(x, y)) darkPixels += 1;
+      }
+      // Si >= 55% de la altura de la tabla tiene píxeles oscuros en esta X, es un separador de columna
+      if (darkPixels / Math.max(1, tableHeightPx) >= 0.55) {
+        vCandidates.push(x);
+      }
+    }
+
+    const vLinesPx = clusterPositions(vCandidates, 5);
+    if (vLinesPx.length < 3) continue; // Mínimo 2 columnas (3 líneas verticales)
+
+    // Asegurar bordes izquierdo y derecho incluidos
+    const colLinesPt = vLinesPx.map((x) => x / renderScale);
+    const rowLinesPt = clusterPositions(
+      grp.map((g) => g.y / renderScale),
+      3
+    );
+
+    if (colLinesPt.length >= 3 && rowLinesPt.length >= 3) {
+      grids.push({
+        x1: colLinesPt[0],
+        y1: rowLinesPt[0],
+        x2: colLinesPt[colLinesPt.length - 1],
+        y2: rowLinesPt[rowLinesPt.length - 1],
+        colLines: colLinesPt,
+        rowLines: rowLinesPt,
+      });
+    }
+  }
+
+  return grids;
+}
+
 function hasVerticalSeparatorLine(
   ctx: CanvasRenderingContext2D | null,
   canvasWidth: number,
@@ -114,7 +271,6 @@ function hasVerticalSeparatorLine(
 
   const imgData = ctx.getImageData(startX, startY, wPx, hPx).data;
 
-  // Buscar una columna de píxeles donde >= 70% de la altura sea más oscura que el fondo blanco/claro
   for (let col = 0; col < wPx; col += 1) {
     let darkCount = 0;
     for (let row = 0; row < hPx; row += 1) {
@@ -131,10 +287,6 @@ function hasVerticalSeparatorLine(
   return false;
 }
 
-/**
- * Detecta si existe una línea horizontal de borde de tabla en el canvas entre y1Pt y y2Pt
- * (útil para separar celdas de texto vertical apiladas).
- */
 function hasHorizontalSeparatorLine(
   ctx: CanvasRenderingContext2D | null,
   canvasWidth: number,
@@ -172,9 +324,6 @@ function hasHorizontalSeparatorLine(
   return false;
 }
 
-/**
- * Muestrea el color de fondo real y color de texto alrededor de la caja en el canvas del PDF.
- */
 function sampleColorsAtBox(
   ctx: CanvasRenderingContext2D | null,
   canvasWidth: number,
@@ -235,9 +384,6 @@ function sampleColorsAtBox(
   };
 }
 
-/**
- * Agrupa ítems horizontales (rotation === 0) en líneas y celdas respetando líneas divisorias de tabla
- */
 function buildHorizontalLines(
   items: RawTextItem[],
   ctx: CanvasRenderingContext2D | null,
@@ -291,9 +437,8 @@ function buildHorizontalLines(
       const gap = last ? item.x - last.xEnd : Infinity;
       const gapThreshold = Math.max(avgFontSize * 0.68, 6.2);
 
-      // Si hay una línea vertical de borde entre las dos palabras, NO unirlas jamás
       const blockedByBorder =
-        last && gap > 0.5 && gap <= gapThreshold * 1.4
+        last && gap > 0.5 && gap <= gapThreshold * 1.6
           ? hasVerticalSeparatorLine(
               ctx,
               canvasWidth,
@@ -342,9 +487,6 @@ function buildHorizontalLines(
   return lines;
 }
 
-/**
- * Agrupa ítems verticales (-90° o 90°) por columna X y cercanía en Y, respetando bordes horizontales
- */
 function buildVerticalSegments(
   items: RawTextItem[],
   ctx: CanvasRenderingContext2D | null,
@@ -358,13 +500,15 @@ function buildVerticalSegments(
 
   if (validItems.length === 0) return [];
 
-  // Agrupar por columna X y misma rotación
   const columns: RawTextItem[][] = [];
   for (const item of validItems) {
     let matched: RawTextItem[] | null = null;
     for (const col of columns) {
       const ref = col[0];
-      if (ref.rotation === item.rotation && Math.abs(item.x - ref.x) <= Math.max(ref.fontSize, item.fontSize) * 0.6) {
+      if (
+        ref.rotation === item.rotation &&
+        Math.abs(item.x - ref.x) <= Math.max(ref.fontSize, item.fontSize) * 0.6
+      ) {
         matched = col;
         break;
       }
@@ -379,7 +523,6 @@ function buildVerticalSegments(
   const results: LineSegment[] = [];
   for (const col of columns) {
     const rot = col[0].rotation;
-    // Si es -90° (se lee de abajo hacia arriba), ordenar por Y descendente; si es 90° (arriba hacia abajo), Y ascendente
     col.sort((a, b) => (rot === -90 ? b.y - a.y : a.y - b.y));
 
     for (const item of col) {
@@ -394,12 +537,10 @@ function buildVerticalSegments(
       let sepY2 = 0;
       if (sameCol) {
         if (rot === -90) {
-          // last está abajo, item está arriba
           gap = last.y - (item.y + item.height);
           sepY1 = item.y + item.height;
           sepY2 = last.y;
         } else {
-          // last está arriba, item está abajo
           gap = item.y - last.yEnd;
           sepY1 = last.yEnd;
           sepY2 = item.y;
@@ -408,7 +549,7 @@ function buildVerticalSegments(
 
       const gapThreshold = Math.max(item.fontSize * 0.72, 6.5);
       const blocked =
-        sameCol && gap > 0.5 && gap <= gapThreshold * 1.4
+        sameCol && gap > 0.5 && gap <= gapThreshold * 1.5
           ? hasHorizontalSeparatorLine(
               ctx,
               canvasWidth,
@@ -450,7 +591,9 @@ function buildVerticalSegments(
 }
 
 /**
- * Construye todos los EditableField (horizontales, verticales y rotados) + tablas detectadas
+ * Construye todos los EditableField + detecta tablas con máxima precisión:
+ * 1) Primero usa las rejillas visuales reales (líneas horizontales y verticales) detectadas en el canvas.
+ * 2) Para tablas sin bordes visibles, usa clustering inteligente de columnas tolerando celdas vacías/multilínea.
  */
 function buildFieldsAndTables(
   items: RawTextItem[],
@@ -547,7 +690,7 @@ function buildFieldsAndTables(
     });
   }
 
-  // 3. Crear campos con otros ángulos (180°, diagonales, etc.)
+  // 3. Crear campos con otros ángulos
   for (const it of otherAngleItems) {
     const text = it.text.replace(/\s+/g, ' ').trim();
     if (!text) continue;
@@ -580,27 +723,141 @@ function buildFieldsAndTables(
     });
   }
 
-  // 4. Detectar tablas sobre las líneas horizontales
-  let i = 0;
-  while (i < lines.length) {
-    if (lines[i].segments.length >= 2) {
-      const groupIndices: number[] = [i];
-      let j = i + 1;
-      while (j < lines.length) {
-        const prev = lines[groupIndices[groupIndices.length - 1]];
-        const next = lines[j];
-        const dy = next.y - prev.y;
-        const maxGap = Math.max(prev.fontSize * 3.2, 34);
-        if (dy <= maxGap && next.segments.length >= 2) {
-          groupIndices.push(j);
-          j += 1;
+  // 4A. Detección exacta de tablas por rejilla visual (bordes reales dibujados en el PDF/escaneo)
+  const assignedFieldIds = new Set<string>();
+  const visualGrids = detectVisualTableGrids(ctx, canvasWidth, canvasHeight, renderScale);
+
+  for (const grid of visualGrids) {
+    const rowCount = grid.rowLines.length - 1;
+    const colCount = grid.colLines.length - 1;
+    if (rowCount < 2 || colCount < 2) continue;
+
+    const tableId = createId('tbl');
+    const cellFieldIds: string[][][] = Array.from({ length: rowCount }, () =>
+      Array.from({ length: colCount }, () => [])
+    );
+
+    let matchedFields = 0;
+
+    for (const fld of fields) {
+      if (assignedFieldIds.has(fld.id)) continue;
+      const cx = fld.x + fld.width / 2;
+      const cy = fld.y + fld.height / 2;
+
+      if (cx < grid.x1 - 3 || cx > grid.x2 + 3 || cy < grid.y1 - 3 || cy > grid.y2 + 3) {
+        continue;
+      }
+
+      // Encontrar fila exacta
+      let rIdx = -1;
+      for (let r = 0; r < rowCount; r += 1) {
+        if (cy >= grid.rowLines[r] - 2 && cy <= grid.rowLines[r + 1] + 2) {
+          rIdx = r;
+          break;
+        }
+      }
+      // Encontrar columna exacta
+      let cIdx = -1;
+      for (let c = 0; c < colCount; c += 1) {
+        if (cx >= grid.colLines[c] - 2 && cx <= grid.colLines[c + 1] + 2) {
+          cIdx = c;
+          break;
+        }
+      }
+
+      if (rIdx >= 0 && cIdx >= 0) {
+        cellFieldIds[rIdx][cIdx].push(fld.id);
+        fld.tableId = tableId;
+        fld.rowIndex = rIdx;
+        fld.colIndex = cIdx;
+        assignedFieldIds.add(fld.id);
+        matchedFields += 1;
+      }
+    }
+
+    if (matchedFields < 3) continue;
+
+    // Filtrar filas completamente vacías al inicio/final si existieran por ruido de borde
+    const nonEmptyRows = cellFieldIds.filter((row) => row.some((cell) => cell.length > 0));
+    if (nonEmptyRows.length < 2) continue;
+
+    const totalW = Math.max(1, grid.x2 - grid.x1);
+    const columnWidths = Array.from({ length: colCount }, (_, c) =>
+      Math.max(4, Math.round(((grid.colLines[c + 1] - grid.colLines[c]) / totalW) * 100))
+    );
+    const sumPct = columnWidths.reduce((s, v) => s + v, 0);
+    if (sumPct !== 100 && columnWidths.length > 0) {
+      columnWidths[columnWidths.length - 1] += 100 - sumPct;
+    }
+
+    const firstRowIds = nonEmptyRows[0].flat();
+    const headerField = fields.find(
+      (f) => firstRowIds.includes(f.id) && f.bgColor !== '#ffffff'
+    );
+
+    tables.push({
+      id: tableId,
+      rowCount: nonEmptyRows.length,
+      colCount,
+      columnWidths,
+      cellFieldIds: nonEmptyRows,
+      y: grid.y1,
+      hasHeader: true,
+      headerBg: headerField?.bgColor ?? '#1e3a8a',
+      detectionMethod: 'grid',
+    });
+  }
+
+  // 4B. Respaldo para tablas SIN bordes dibujados (clustering inteligente de columnas tolerando filas con 1 celda)
+  const unassignedLineIndices: number[] = [];
+  lineFieldMap.forEach((rowFields, idx) => {
+    const remaining = rowFields.filter((f) => !assignedFieldIds.has(f.id));
+    if (remaining.length > 0) {
+      unassignedLineIndices.push(idx);
+    }
+  });
+
+  let ptr = 0;
+  while (ptr < unassignedLineIndices.length) {
+    const lineIdx = unassignedLineIndices[ptr];
+    const rowFlds = lineFieldMap[lineIdx].filter((f) => !assignedFieldIds.has(f.id));
+
+    if (rowFlds.length >= 2) {
+      const groupIndices: number[] = [lineIdx];
+      let nextPtr = ptr + 1;
+
+      while (nextPtr < unassignedLineIndices.length) {
+        const prevIdx = groupIndices[groupIndices.length - 1];
+        const candIdx = unassignedLineIndices[nextPtr];
+        const dy = lines[candIdx].y - lines[prevIdx].y;
+        const maxGap = Math.max(lines[prevIdx].fontSize * 3.4, 36);
+        const candFlds = lineFieldMap[candIdx].filter((f) => !assignedFieldIds.has(f.id));
+
+        if (dy > maxGap) break;
+
+        if (candFlds.length >= 2) {
+          groupIndices.push(candIdx);
+          nextPtr += 1;
+        } else if (
+          candFlds.length === 1 &&
+          nextPtr + 1 < unassignedLineIndices.length &&
+          lines[unassignedLineIndices[nextPtr + 1]].y - lines[candIdx].y <= maxGap &&
+          lineFieldMap[unassignedLineIndices[nextPtr + 1]].filter(
+            (f) => !assignedFieldIds.has(f.id)
+          ).length >= 2
+        ) {
+          // Permitir filas intermedias con 1 celda sin romper la tabla
+          groupIndices.push(candIdx);
+          nextPtr += 1;
         } else {
           break;
         }
       }
 
       if (groupIndices.length >= 2) {
-        const tableFields = groupIndices.flatMap((idx) => lineFieldMap[idx]);
+        const tableFields = groupIndices.flatMap((idx) =>
+          lineFieldMap[idx].filter((f) => !assignedFieldIds.has(f.id))
+        );
         const intervals = tableFields
           .map((f) => ({ start: f.x, end: f.x + f.width }))
           .sort((a, b) => a.start - b.start);
@@ -621,15 +878,17 @@ function buildFieldsAndTables(
 
         if (cols.length >= 2) {
           const tableId = createId('tbl');
-          const cellFieldIds: (string | null)[][] = [];
+          const cellFieldIds: string[][][] = [];
 
-          groupIndices.forEach((lineIdx, rIdx) => {
-            const rowIds: (string | null)[] = new Array(cols.length).fill(null);
-            for (const fld of lineFieldMap[lineIdx]) {
+          groupIndices.forEach((gIdx, rIdx) => {
+            const rowCells: string[][] = Array.from({ length: cols.length }, () => []);
+            const fldsInLine = lineFieldMap[gIdx].filter((f) => !assignedFieldIds.has(f.id));
+            for (const fld of fldsInLine) {
               let bestCol = 0;
               let bestScore = -Infinity;
               cols.forEach((col, cIdx) => {
-                const overlap = Math.min(fld.x + fld.width, col.end) - Math.max(fld.x, col.start);
+                const overlap =
+                  Math.min(fld.x + fld.width, col.end) - Math.max(fld.x, col.start);
                 const dist = Math.abs(fld.x + fld.width / 2 - (col.start + col.end) / 2);
                 const score = overlap > 0 ? overlap + 1000 - dist * 0.1 : -dist;
                 if (score > bestScore) {
@@ -641,11 +900,10 @@ function buildFieldsAndTables(
               fld.tableId = tableId;
               fld.rowIndex = rIdx;
               fld.colIndex = bestCol;
-              if (!rowIds[bestCol]) {
-                rowIds[bestCol] = fld.id;
-              }
+              assignedFieldIds.add(fld.id);
+              rowCells[bestCol].push(fld.id);
             }
-            cellFieldIds.push(rowIds);
+            cellFieldIds.push(rowCells);
           });
 
           const rawWidths = cols.map((col, idx) => {
@@ -653,88 +911,40 @@ function buildFieldsAndTables(
             return Math.max(col.end - col.start, nextStart - col.start, 24);
           });
           const totalSpan = rawWidths.reduce((s, w) => s + w, 0) || 1;
-          const columnWidths = rawWidths.map((w) => Math.max(6, Math.round((w / totalSpan) * 100)));
+          const columnWidths = rawWidths.map((w) => Math.max(5, Math.round((w / totalSpan) * 100)));
           const sumPct = columnWidths.reduce((s, w) => s + w, 0);
           if (sumPct !== 100 && columnWidths.length > 0) {
             columnWidths[columnWidths.length - 1] += 100 - sumPct;
           }
 
-          const firstRowFields = lineFieldMap[groupIndices[0]];
+          const firstRowFlds = lineFieldMap[groupIndices[0]];
           const headerBg =
-            firstRowFields.find((f) => f.bgColor !== '#ffffff')?.bgColor ?? '#1e3a8a';
+            firstRowFlds.find((f) => f.bgColor !== '#ffffff')?.bgColor ?? '#1e3a8a';
 
           tables.push({
             id: tableId,
-            rowCount: groupIndices.length,
+            rowCount: cellFieldIds.length,
             colCount: cols.length,
             columnWidths,
             cellFieldIds,
             y: lines[groupIndices[0]].y,
             hasHeader: true,
             headerBg,
+            detectionMethod: 'alignment',
           });
 
-          i = j;
+          ptr = nextPtr;
           continue;
         }
       }
     }
-    i += 1;
+    ptr += 1;
   }
 
+  tables.sort((a, b) => a.y - b.y);
   return { fields, tables };
 }
 
-/**
- * Recorta el área superior con logo/membrete si contiene gráficos relevantes
- */
-function extractTopLogoBanner(
-  canvas: HTMLCanvasElement,
-  pageWidth: number,
-  pageHeight: number,
-  tables: DetectedTable[],
-  renderScale: number
-): { dataUrl?: string; widthPt?: number; heightPt?: number } {
-  const firstTableY = tables.length > 0 ? Math.min(...tables.map((t) => t.y)) : pageHeight * 0.2;
-  const bannerHeightPt = Math.min(Math.max(firstTableY - 12, 0), pageHeight * 0.22);
-  if (bannerHeightPt < 36) return {};
-
-  const cropH = Math.min(canvas.height, Math.round(bannerHeightPt * renderScale));
-  const cropW = canvas.width;
-  if (cropH < 30 || cropW < 30) return {};
-
-  const tempCanvas = document.createElement('canvas');
-  tempCanvas.width = cropW;
-  tempCanvas.height = cropH;
-  const tCtx = tempCanvas.getContext('2d');
-  if (!tCtx) return {};
-
-  tCtx.drawImage(canvas, 0, 0, cropW, cropH, 0, 0, cropW, cropH);
-
-  const imgData = tCtx.getImageData(0, 0, cropW, cropH).data;
-  let coloredPixels = 0;
-  for (let p = 0; p < imgData.length; p += 16) {
-    const r = imgData[p];
-    const g = imgData[p + 1];
-    const b = imgData[p + 2];
-    const maxDiff = Math.max(Math.abs(r - g), Math.abs(g - b), Math.abs(r - b));
-    if (maxDiff > 22) {
-      coloredPixels += 1;
-    }
-  }
-
-  if (coloredPixels < 120) return {};
-
-  return {
-    dataUrl: tempCanvas.toDataURL('image/png'),
-    widthPt: pageWidth,
-    heightPt: bannerHeightPt,
-  };
-}
-
-/**
- * Preprocesa la imagen de una página (escala de grises + contraste) para mejorar la precisión de Tesseract OCR
- */
 function createHighContrastOcrDataUrl(sourceCanvas: HTMLCanvasElement): string {
   const out = document.createElement('canvas');
   out.width = sourceCanvas.width;
@@ -747,8 +957,7 @@ function createHighContrastOcrDataUrl(sourceCanvas: HTMLCanvasElement): string {
   const d = img.data;
   for (let i = 0; i < d.length; i += 4) {
     const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    // Aumentar contraste suave para texto nítido sin perder texto sobre encabezados oscuros
-    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.35 + 128));
+    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.45 + 128));
     d[i] = contrasted;
     d[i + 1] = contrasted;
     d[i + 2] = contrasted;
@@ -757,9 +966,6 @@ function createHighContrastOcrDataUrl(sourceCanvas: HTMLCanvasElement): string {
   return out.toDataURL('image/png');
 }
 
-/**
- * Ejecuta OCR con Tesseract.js y detecta también palabras verticales (cuando altura >> ancho)
- */
 async function extractItemsWithOcr(
   imageDataUrl: string,
   pageWidth: number,
@@ -795,8 +1001,6 @@ async function extractItemsWithOcr(
           const y = word.bbox.y0 * scaleY;
           const width = Math.max(4, (word.bbox.x1 - word.bbox.x0) * scaleX);
           const height = Math.max(8, (word.bbox.y1 - word.bbox.y0) * scaleY);
-
-          // Si una palabra de >= 3 caracteres es mucho más alta que ancha, es texto vertical
           const isVerticalWord = text.length >= 3 && height > width * 1.9;
 
           items.push({
@@ -818,8 +1022,8 @@ async function extractItemsWithOcr(
 }
 
 /**
- * Escanea un archivo PDF usando la matriz exacta del viewport de pdfjs-dist
- * (maneja páginas horizontales, verticales, rotadas 90/180/270 y texto vertical/inclinado).
+ * Escanea un archivo PDF (digital o escaneado como imagen) usando pdfjs-dist + Tesseract OCR
+ * y detector de rejillas reales de tablas.
  */
 export async function scanPdfFile(
   file: File,
@@ -848,7 +1052,7 @@ export async function scanPdfFile(
       stage: 'parsing',
       currentPage: pageNum,
       totalPages,
-      message: `Analizando página ${pageNum} de ${totalPages} (orientación, tablas y texto)...`,
+      message: `Analizando página ${pageNum} de ${totalPages} (rejillas de tablas y texto)...`,
     });
 
     const page = await pdf.getPage(pageNum);
@@ -870,7 +1074,6 @@ export async function scanPdfFile(
 
     const originalImageUrl = canvas.toDataURL('image/png');
 
-    // Extraer texto nativo transformando CADA ítem con la matriz exacta del viewport
     const textContent = await page.getTextContent();
     const styles = textContent.styles as Record<string, { fontFamily?: string }>;
     const rawItems: RawTextItem[] = [];
@@ -880,7 +1083,6 @@ export async function scanPdfFile(
       const str = item.str;
       if (!str || !str.trim()) continue;
 
-      // Multiplicar viewport.transform × item.transform -> coordenadas exactas en pantalla (maneja horizontal/rotado/CropBox)
       const m = pdfjsLib.Util.transform(baseViewport.transform, item.transform);
       const fontSize = Math.hypot(m[2], m[3]) || Math.hypot(m[0], m[1]) || item.height || 10;
       const angleDeg = normalizeAngleDeg((Math.atan2(m[1], m[0]) * 180) / Math.PI);
@@ -893,19 +1095,16 @@ export async function scanPdfFile(
       let height = Math.max(fontSize * 1.15, item.height || fontSize);
 
       if (angleDeg === -90) {
-        // Texto vertical leyendo de abajo hacia arriba
         width = Math.max(fontSize * 1.18, item.height || fontSize);
         height = advanceLen;
         x = m[4] - fontSize * 0.85;
         y = m[5] - advanceLen;
       } else if (angleDeg === 90) {
-        // Texto vertical leyendo de arriba hacia abajo
         width = Math.max(fontSize * 1.18, item.height || fontSize);
         height = advanceLen;
         x = m[4] - fontSize * 0.2;
         y = m[5];
       } else if (angleDeg === 180) {
-        // Texto invertido
         x = m[4] - advanceLen;
         y = m[5] - fontSize * 0.2;
       }
@@ -927,24 +1126,37 @@ export async function scanPdfFile(
     let extractionMode: 'text' | 'ocr' = 'text';
     let itemsToUse = rawItems;
 
-    // Si es PDF escaneado como foto/imagen, ejecutar OCR con preprocesado de contraste
+    // Si es un PDF escaneado (foto/imagen sin texto seleccionable), ejecutar OCR en alta resolución (2.5x)
     if (charCount < 15) {
       extractionMode = 'ocr';
       onProgress?.({
         stage: 'ocr',
         currentPage: pageNum,
         totalPages,
-        message: `Página ${pageNum} escaneada como imagen. Ejecutando OCR (Tesseract)...`,
+        message: `Página ${pageNum} detectada como escaneo/imagen. Reconociendo texto con OCR...`,
       });
 
       try {
-        const ocrImage = createHighContrastOcrDataUrl(canvas);
+        const ocrScale = 2.5;
+        const ocrViewport = page.getViewport({ scale: ocrScale });
+        const ocrCanvas = document.createElement('canvas');
+        ocrCanvas.width = Math.round(ocrViewport.width);
+        ocrCanvas.height = Math.round(ocrViewport.height);
+        const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+        if (ocrCtx) {
+          await page.render({
+            canvasContext: ocrCtx,
+            viewport: ocrViewport,
+            canvas: ocrCanvas,
+          }).promise;
+        }
+        const ocrImage = createHighContrastOcrDataUrl(ocrCanvas);
         itemsToUse = await extractItemsWithOcr(
           ocrImage,
           baseViewport.width,
           baseViewport.height,
-          canvas.width,
-          canvas.height
+          ocrCanvas.width,
+          ocrCanvas.height
         );
       } catch (err) {
         console.error('Error ejecutando OCR:', err);
@@ -959,14 +1171,6 @@ export async function scanPdfFile(
       renderScale
     );
 
-    const banner = extractTopLogoBanner(
-      canvas,
-      baseViewport.width,
-      baseViewport.height,
-      tables,
-      renderScale
-    );
-
     const vt = baseViewport.transform as [number, number, number, number, number, number];
 
     pages.push({
@@ -976,9 +1180,6 @@ export async function scanPdfFile(
       pageRotation: page.rotate ?? 0,
       viewportTransform: [vt[0], vt[1], vt[2], vt[3], vt[4], vt[5]],
       originalImageUrl,
-      logoBannerDataUrl: banner.dataUrl,
-      logoBannerWidth: banner.widthPt,
-      logoBannerHeight: banner.heightPt,
       extractionMode,
       fields,
       tables,
@@ -996,50 +1197,5 @@ export async function scanPdfFile(
     fileName: file.name,
     originalPdfBytes,
     pages,
-  };
-}
-
-/**
- * Re-escanea una página con Tesseract OCR (incluye preprocesado de contraste)
- */
-export async function rescanPageWithOcr(page: ScannedPage): Promise<ScannedPage> {
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const el = new Image();
-    el.onload = () => resolve(el);
-    el.onerror = reject;
-    el.src = page.originalImageUrl;
-  });
-
-  const canvas = document.createElement('canvas');
-  canvas.width = img.naturalWidth || Math.round(page.width * 2);
-  canvas.height = img.naturalHeight || Math.round(page.height * 2);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (ctx) {
-    ctx.drawImage(img, 0, 0);
-  }
-
-  const renderScale = canvas.width / page.width;
-  const ocrImage = createHighContrastOcrDataUrl(canvas);
-  const ocrItems = await extractItemsWithOcr(
-    ocrImage,
-    page.width,
-    page.height,
-    canvas.width,
-    canvas.height
-  );
-
-  const { fields, tables } = buildFieldsAndTables(
-    ocrItems,
-    ctx,
-    canvas.width,
-    canvas.height,
-    renderScale
-  );
-
-  return {
-    ...page,
-    extractionMode: 'ocr',
-    fields,
-    tables,
   };
 }

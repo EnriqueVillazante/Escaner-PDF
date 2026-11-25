@@ -166,6 +166,17 @@ button {
   border-color: var(--word-hover);
 }
 
+.btn-odt {
+  background: #6d28d9;
+  border-color: #6d28d9;
+  color: #ffffff;
+}
+
+.btn-odt:hover:not(:disabled) {
+  background: #5b21b6;
+  border-color: #5b21b6;
+}
+
 .btn-danger-ghost {
   border-color: #fecaca;
   background: var(--danger-soft);
